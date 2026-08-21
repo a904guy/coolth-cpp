@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+reference/
+tests/test_protocol
+tests/test_discovery_cloud
+tests/test_control
+tests/test_cloud_lan
+tests/test_device_cc
+tests/test_lan
+cli/coolth-cpp
