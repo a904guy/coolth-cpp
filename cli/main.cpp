@@ -17,7 +17,7 @@
 #include "../components/coolth/discovery.h"
 #include "../components/coolth/lan.h"
 #include "../components/coolth/properties.h"
-#include "net_posix.h"
+#include "net.h"
 
 using namespace coolth;
 
@@ -60,19 +60,28 @@ void usage() {
       "  fahrenheit=on|off  target_humidity=0-100\n");
 }
 
-std::string now_stamp() {
+// gmtime_r is POSIX; the Windows CRT spells it gmtime_s, with the arguments
+// the other way round.
+void utc_now(struct tm *out) {
   const time_t now = time(nullptr);
+#ifdef _WIN32
+  gmtime_s(out, &now);
+#else
+  gmtime_r(&now, out);
+#endif
+}
+
+std::string now_stamp() {
   struct tm utc;
-  gmtime_r(&now, &utc);
+  utc_now(&utc);
   char buffer[32];
   strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", &utc);
   return buffer;
 }
 
 void now_packet_timestamp(uint8_t out[8]) {
-  const time_t now = time(nullptr);
   struct tm utc;
-  gmtime_r(&now, &utc);
+  utc_now(&utc);
   make_lan_timestamp(utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
                      utc.tm_hour, utc.tm_min, utc.tm_sec, 0, out);
 }
@@ -237,7 +246,7 @@ bool exchange(const Options &options, const Bytes &frame, Bytes *reply,
     return relay.send(frame, reply, error);
   }
 
-  int handle = -1;
+  coolth_cli::Socket handle = coolth_cli::kInvalidSocket;
   Connection connection;
   if (!coolth_cli::tcp_connect(options.host, 6444, options.timeout, &handle,
                                &connection)) {

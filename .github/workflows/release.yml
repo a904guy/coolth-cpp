@@ -1,0 +1,141 @@
+# Builds the released binaries: one file per platform, no runtime dependency.
+#
+# mbedtls is compiled from source for every target rather than taken from the
+# host, so each binary carries the same TLS, and the roots it trusts are the
+# ones baked into cli/ca_bundle.h.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libmbedtls-dev
+      - run: make -C tests check
+
+  linux:
+    name: linux-${{ matrix.arch }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The arm64 runner is free for public repositories. Without it, the
+          # same build works under QEMU via docker/setup-qemu-action, slowly.
+          - {arch: x86_64, runner: ubuntu-latest, image: 'alpine:3.20'}
+          - {arch: aarch64, runner: ubuntu-24.04-arm, image: 'alpine:3.20'}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # Built in Alpine, so the binary is musl-linked and genuinely static.
+      # glibc cannot static link getaddrinfo without dragging NSS along.
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ${{ matrix.image }} sh -c '
+            apk add --no-cache build-base cmake curl &&
+            sh tools/build_mbedtls.sh /opt/mbedtls &&
+            make -C cli STATIC=1 MBEDTLS_PREFIX=/opt/mbedtls &&
+            strip cli/coolth-cpp'
+      - name: Check it is self-contained
+        run: |
+          file cli/coolth-cpp | tee /dev/stderr | grep -q 'statically linked'
+          ./cli/coolth-cpp | head -1
+      - run: mv cli/coolth-cpp coolth-cpp-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coolth-cpp-linux-${{ matrix.arch }}
+          path: coolth-cpp-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  macos:
+    name: macos-universal
+    needs: test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # Both slices in one pass: mbedtls builds universal static archives, and
+      # the compiler emits a fat Mach-O directly, so there is no lipo step.
+      - name: Build
+        env:
+          CMAKE_EXTRA: >-
+            -DCMAKE_OSX_ARCHITECTURES=arm64;x86_64
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+        run: |
+          sh tools/build_mbedtls.sh "$PWD/mbedtls-install"
+          make -C cli MBEDTLS_PREFIX="$PWD/mbedtls-install" \
+            ARCHFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
+          strip cli/coolth-cpp
+      # Apple does not offer a static libc, so the only dependency left is the
+      # system one every macOS has.
+      - name: Check both slices and the dependencies
+        run: |
+          lipo -info cli/coolth-cpp | tee /dev/stderr | grep -q 'x86_64 arm64'
+          otool -L cli/coolth-cpp
+          ./cli/coolth-cpp | head -1
+      - run: mv cli/coolth-cpp coolth-cpp-macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coolth-cpp-macos-universal
+          path: coolth-cpp-macos-universal
+          if-no-files-found: error
+
+  windows:
+    name: windows-x86_64
+    needs: test
+    # Cross compiled: mingw on Linux is one toolchain to install, against
+    # MSYS2 plus a per-dependency build on a Windows runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64 cmake
+      - name: Build
+        env:
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+          CMAKE_EXTRA: >-
+            -DCMAKE_SYSTEM_NAME=Windows
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres
+            -DCMAKE_FIND_ROOT_PATH=/usr/x86_64-w64-mingw32
+        run: |
+          sh tools/build_mbedtls.sh "$PWD/mbedtls-install"
+          make -C cli CXX=x86_64-w64-mingw32-g++ STATIC=1 \
+            MBEDTLS_PREFIX="$PWD/mbedtls-install"
+          x86_64-w64-mingw32-strip cli/coolth-cpp.exe
+      - name: Check it is a Windows binary
+        run: file cli/coolth-cpp.exe | tee /dev/stderr | grep -q 'PE32+ executable'
+      - run: mv cli/coolth-cpp.exe coolth-cpp-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coolth-cpp-windows-x86_64
+          path: coolth-cpp-windows-x86_64.exe
+          if-no-files-found: error
+
+  release:
+    needs: [linux, macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {path: artifacts, merge-multiple: true}
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts
+          chmod +x coolth-cpp-linux-* coolth-cpp-macos-*
+          sha256sum * > SHA256SUMS
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" --generate-notes ./*

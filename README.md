@@ -3,14 +3,12 @@
 A C++ implementation of Midea's **V3 LAN protocol**, the one their air
 conditioners speak on TCP port 6444, with no dependency beyond mbedtls.
 
-It exists because nothing else does. Every open-source Midea integration for
-microcontrollers goes through a UART dongle wired inside the appliance, or
+Almost all open-source Midea integration for microcontrollers goes through a UART dongle wired inside the appliance, or
 through IR. If you want an ESP32 to control a Midea AC the same way a phone on
 the same WiFi does, over the network, authenticated, with state read back,
 this is that.
 
-It's a port of [coolth](https://github.com/a904guy/coolth-ac-controller), and
-it's verified against it byte-for-byte.
+It's a port of [coolth](https://github.com/a904guy/coolth-ac-controller) for c++
 
 ## Supported air conditioners
 
@@ -166,17 +164,46 @@ format is always Celsius, in half-degree steps, so 75 °F is 24.0 °C.
 For a complete worked example including sockets, session lifetime and retries,
 see `../esphome/components/midea_lan/midea_lan.cpp`.
 
+## Installing
+
+Each release carries one binary per platform, with nothing to install beside
+it. Download, mark it executable, run it.
+
+| File | Runs on |
+|---|---|
+| `coolth-cpp-linux-x86_64` | any Linux; musl-linked, so no glibc version to match |
+| `coolth-cpp-linux-aarch64` | 64-bit ARM Linux, Raspberry Pi included |
+| `coolth-cpp-macos-universal` | macOS 11 and later, Apple silicon and Intel in one file |
+| `coolth-cpp-windows-x86_64.exe` | Windows |
+
+```bash
+curl -LO https://github.com/a904guy/coolth-cpp/releases/latest/download/coolth-cpp-linux-x86_64
+chmod +x coolth-cpp-linux-x86_64
+./coolth-cpp-linux-x86_64 discover
+```
+
+`SHA256SUMS` is published alongside them. The macOS build is unsigned, so
+Gatekeeper will want `xattr -d com.apple.quarantine` on first run.
+
+Because a static binary cannot read the host's certificate store, the cloud
+commands verify TLS against Mozilla's roots, compiled in from
+`cli/ca_bundle.h`. Behind a network that intercepts TLS, or if a root rotates
+before the next release, point `COOLTH_CA_BUNDLE` at a PEM file and that is
+used instead.
+
 ## Building
 
 Needs only mbedtls (`libmbedtls-dev` on Debian/Ubuntu; already present in
-ESP-IDF). Two files, no build system required:
+ESP-IDF). The library itself uses only the crypto half. Two files, no build
+system required:
 
 ```bash
 g++ -std=c++17 -c components/coolth/*.cpp -lmbedcrypto
 ```
 
-The command line tool additionally wants libcurl for the cloud commands; it
-builds without it and the LAN commands still work:
+The command line tool adds the TLS half, for the cloud commands. There is no
+other dependency -- the HTTPS client is `cli/https.cpp`, about two hundred
+lines over mbedtls, which is what lets a released binary be a single file:
 
 ```bash
 make -C cli
@@ -185,6 +212,18 @@ make -C cli
 ./cli/coolth-cpp control 192.0.2.10 --auto --account you@example.com \
     --password secret target_temperature=24 mode=cool fan_speed=auto
 ```
+
+To reproduce a released binary, build mbedtls statically first and link
+against that:
+
+```bash
+sh tools/build_mbedtls.sh /opt/mbedtls
+make -C cli STATIC=1 MBEDTLS_PREFIX=/opt/mbedtls
+```
+
+`.github/workflows/release.yml` does exactly this per platform: musl in an
+Alpine container for Linux, `-arch arm64 -arch x86_64` in one pass for the
+macOS universal binary, and mingw cross compilation for Windows.
 
 ## Layout
 
@@ -200,8 +239,12 @@ components/coolth/     the library
   cloud_lan.h/.cpp     relaying frames through the cloud
   json_lite.h/.cpp     just enough JSON for the cloud's replies
 cli/                   the command line tool
+  main.cpp             commands and argument parsing
+  net.h/.cpp           sockets, POSIX and Winsock
+  https.cpp            an HTTPS POST over mbedtls, so there is no libcurl
+  ca_bundle.h          Mozilla's roots, generated, compiled into the binary
 tests/                 host tests and golden vectors
-tools/                 vector generator
+tools/                 vector generator, and the release build helpers
 ```
 
 It is also a valid ESPHome component; see below.
